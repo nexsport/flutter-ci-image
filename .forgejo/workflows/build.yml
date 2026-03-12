@@ -50,62 +50,63 @@ jobs:
           -t ${{ env.IMAGE }}:${{ steps.version.outputs.TAG }}
           .
 
+      - name: Tag latest
+        if: github.ref_type == 'tag'
+        run: docker tag ${{ env.IMAGE }}:${{ steps.version.outputs.TAG }} ${{ env.IMAGE }}:latest
+
       - name: Push image
-        run: docker push ${{ env.IMAGE }}:${{ steps.version.outputs.TAG }}
+        run: |
+          docker push ${{ env.IMAGE }}:${{ steps.version.outputs.TAG }}
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            docker push ${{ env.IMAGE }}:latest
+          fi
 
       - name: Extract tool versions
         id: tools
         run: |
           IMG="${{ env.IMAGE }}:${{ steps.version.outputs.TAG }}"
-          FLUTTER_V=$(docker run --rm "$IMG" flutter --version | head -1)
-          DART_V=$(docker run --rm "$IMG" dart --version 2>&1 | head -1)
-          JAVA_V=$(docker run --rm "$IMG" java --version 2>&1 | head -1)
-          NODE_V=$(docker run --rm "$IMG" node --version)
-          RUBY_V=$(docker run --rm "$IMG" ruby --version | cut -d' ' -f1-2)
-          GRADLE_V=$(docker run --rm "$IMG" bash -c 'cd /tmp && flutter create _g > /dev/null 2>&1 && cd _g/android && ./gradlew --version 2>/dev/null | grep "^Gradle " && cd / && rm -rf /tmp/_g' 2>/dev/null || echo "cached")
-
-          EOF_MARKER=$(dd if=/dev/urandom bs=15 count=1 2>/dev/null | base64)
-          echo "VERSIONS<<${EOF_MARKER}" >> "$GITHUB_OUTPUT"
-          echo "| Outil | Version |" >> "$GITHUB_OUTPUT"
-          echo "|-------|---------|" >> "$GITHUB_OUTPUT"
-          echo "| Flutter | $FLUTTER_V |" >> "$GITHUB_OUTPUT"
-          echo "| Dart | $DART_V |" >> "$GITHUB_OUTPUT"
-          echo "| Java | $JAVA_V |" >> "$GITHUB_OUTPUT"
-          echo "| Node.js | $NODE_V |" >> "$GITHUB_OUTPUT"
-          echo "| Ruby | $RUBY_V |" >> "$GITHUB_OUTPUT"
-          echo "| Android Build-Tools | ${{ env.ANDROID_BUILD_TOOLS }} |" >> "$GITHUB_OUTPUT"
-          echo "| Android Platforms | ${{ env.ANDROID_PLATFORMS }} |" >> "$GITHUB_OUTPUT"
-          echo "| Android NDK | ${{ env.ANDROID_NDK }} |" >> "$GITHUB_OUTPUT"
-          echo "| CMake | ${{ env.CMAKE_VERSION }} |" >> "$GITHUB_OUTPUT"
-          echo "| Fastlane | ${{ env.FASTLANE_VERSION }} |" >> "$GITHUB_OUTPUT"
-          echo "${EOF_MARKER}" >> "$GITHUB_OUTPUT"
+          VERSIONS=$(docker run --rm "$IMG" bash -c '
+            echo "| Outil | Version |"
+            echo "|-------|---------|"
+            echo "| Flutter | $(flutter --version | head -1) |"
+            echo "| Dart | $(dart --version 2>&1 | head -1) |"
+            echo "| Java | $(java --version 2>&1 | head -1) |"
+            echo "| Node.js | $(node --version) |"
+            echo "| Ruby | $(ruby --version | cut -d" " -f1-2) |"
+            GRADLE_V=$(ls /root/.gradle/wrapper/dists/ 2>/dev/null | grep -oP "gradle-\K[0-9.]+" | head -1 || echo "pre-cached")
+            echo "| Gradle | $GRADLE_V |"
+          ')
+          echo "VERSIONS<<TOOLSEOF" >> "$GITHUB_OUTPUT"
+          echo "$VERSIONS" >> "$GITHUB_OUTPUT"
+          echo "TOOLSEOF" >> "$GITHUB_OUTPUT"
 
       - name: Create Forgejo release
         if: github.ref_type == 'tag'
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.TAG }}
+          RELEASE_IMAGE: ${{ env.IMAGE }}:${{ steps.version.outputs.TAG }}
+          RELEASE_VERSIONS: ${{ steps.tools.outputs.VERSIONS }}
+          RELEASE_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          RELEASE_API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}/releases
         run: |
-          BODY=$(cat <<'RELEASE_EOF'
-          **Image Docker :** `${{ env.IMAGE }}:${{ steps.version.outputs.TAG }}`
+          read -r -d '' BODY <<EOF || true
+          **Image Docker :** \`${RELEASE_IMAGE}\`
 
-          ```
-          docker pull ${{ env.IMAGE }}:${{ steps.version.outputs.TAG }}
-          ```
+          \`\`\`
+          docker pull ${RELEASE_IMAGE}
+          \`\`\`
 
           ### Outils installés
 
-          ${{ steps.tools.outputs.VERSIONS }}
+          ${RELEASE_VERSIONS}
 
           ### Base
 
           Debian 13 Trixie slim
-          RELEASE_EOF
-          )
+          EOF
           BODY=$(echo "$BODY" | sed 's/^          //')
-          PAYLOAD=$(jq -n \
-            --arg tag "${{ steps.version.outputs.TAG }}" \
-            --arg body "$BODY" \
-            '{tag_name: $tag, name: $tag, body: $body, draft: false, prerelease: false}')
-          curl -s -X POST \
-            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/releases" \
-            -H "Authorization: token ${{ secrets.REGISTRY_TOKEN }}" \
+          ESCAPED_BODY=$(printf '%s' "$BODY" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+          curl -sf -X POST "${RELEASE_API}" \
+            -H "Authorization: token ${RELEASE_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d "$PAYLOAD"
+            -d "{\"tag_name\":\"${RELEASE_TAG}\",\"name\":\"${RELEASE_TAG}\",\"body\":${ESCAPED_BODY},\"draft\":false,\"prerelease\":false}"
