@@ -1,0 +1,111 @@
+name: Build & Push Image
+
+on:
+  push:
+    tags: ['*']
+  workflow_dispatch:
+
+env:
+  REGISTRY: nxsonpvmsgit001.nexsport.priv:3000
+  IMAGE: nxsonpvmsgit001.nexsport.priv:3000/infrastructure/docker-flutter-ci
+  FASTLANE_VERSION: "2.232.1"
+  ANDROID_BUILD_TOOLS: "35.0.0"
+  ANDROID_PLATFORMS: "36"
+  ANDROID_NDK: "28.2.13676358"
+  CMAKE_VERSION: "3.22.1"
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          github-server-url: http://nxsonpvmsgit001.nexsport.priv:3000
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            echo "TAG=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "TAG=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Login to Forgejo Registry
+        run: >
+          echo "${{ secrets.REGISTRY_TOKEN }}" |
+          docker login ${{ env.REGISTRY }}
+          -u "${{ secrets.REGISTRY_USER }}" --password-stdin
+
+      - name: Build image
+        run: >
+          docker build
+          --target android
+          --build-arg flutter_version=${{ steps.version.outputs.TAG }}
+          --build-arg fastlane_version=${{ env.FASTLANE_VERSION }}
+          --build-arg android_build_tools_version=${{ env.ANDROID_BUILD_TOOLS }}
+          --build-arg android_platform_versions="${{ env.ANDROID_PLATFORMS }}"
+          --build-arg android_ndk_version=${{ env.ANDROID_NDK }}
+          --build-arg cmake_version=${{ env.CMAKE_VERSION }}
+          -t ${{ env.IMAGE }}:${{ steps.version.outputs.TAG }}
+          .
+
+      - name: Push image
+        run: docker push ${{ env.IMAGE }}:${{ steps.version.outputs.TAG }}
+
+      - name: Extract tool versions
+        id: tools
+        run: |
+          IMG="${{ env.IMAGE }}:${{ steps.version.outputs.TAG }}"
+          FLUTTER_V=$(docker run --rm "$IMG" flutter --version | head -1)
+          DART_V=$(docker run --rm "$IMG" dart --version 2>&1 | head -1)
+          JAVA_V=$(docker run --rm "$IMG" java --version 2>&1 | head -1)
+          NODE_V=$(docker run --rm "$IMG" node --version)
+          RUBY_V=$(docker run --rm "$IMG" ruby --version | cut -d' ' -f1-2)
+          GRADLE_V=$(docker run --rm "$IMG" bash -c 'cd /tmp && flutter create _g > /dev/null 2>&1 && cd _g/android && ./gradlew --version 2>/dev/null | grep "^Gradle " && cd / && rm -rf /tmp/_g' 2>/dev/null || echo "cached")
+
+          EOF_MARKER=$(dd if=/dev/urandom bs=15 count=1 2>/dev/null | base64)
+          echo "VERSIONS<<${EOF_MARKER}" >> "$GITHUB_OUTPUT"
+          echo "| Outil | Version |" >> "$GITHUB_OUTPUT"
+          echo "|-------|---------|" >> "$GITHUB_OUTPUT"
+          echo "| Flutter | $FLUTTER_V |" >> "$GITHUB_OUTPUT"
+          echo "| Dart | $DART_V |" >> "$GITHUB_OUTPUT"
+          echo "| Java | $JAVA_V |" >> "$GITHUB_OUTPUT"
+          echo "| Node.js | $NODE_V |" >> "$GITHUB_OUTPUT"
+          echo "| Ruby | $RUBY_V |" >> "$GITHUB_OUTPUT"
+          echo "| Android Build-Tools | ${{ env.ANDROID_BUILD_TOOLS }} |" >> "$GITHUB_OUTPUT"
+          echo "| Android Platforms | ${{ env.ANDROID_PLATFORMS }} |" >> "$GITHUB_OUTPUT"
+          echo "| Android NDK | ${{ env.ANDROID_NDK }} |" >> "$GITHUB_OUTPUT"
+          echo "| CMake | ${{ env.CMAKE_VERSION }} |" >> "$GITHUB_OUTPUT"
+          echo "| Fastlane | ${{ env.FASTLANE_VERSION }} |" >> "$GITHUB_OUTPUT"
+          echo "${EOF_MARKER}" >> "$GITHUB_OUTPUT"
+
+      - name: Create Forgejo release
+        if: github.ref_type == 'tag'
+        run: |
+          BODY=$(cat <<'RELEASE_EOF'
+          **Image Docker :** `${{ env.IMAGE }}:${{ steps.version.outputs.TAG }}`
+
+          ```
+          docker pull ${{ env.IMAGE }}:${{ steps.version.outputs.TAG }}
+          ```
+
+          ### Outils installés
+
+          ${{ steps.tools.outputs.VERSIONS }}
+
+          ### Base
+
+          Debian 13 Trixie slim
+          RELEASE_EOF
+          )
+          BODY=$(echo "$BODY" | sed 's/^          //')
+          PAYLOAD=$(jq -n \
+            --arg tag "${{ steps.version.outputs.TAG }}" \
+            --arg body "$BODY" \
+            '{tag_name: $tag, name: $tag, body: $body, draft: false, prerelease: false}')
+          curl -s -X POST \
+            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/releases" \
+            -H "Authorization: token ${{ secrets.REGISTRY_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD"
